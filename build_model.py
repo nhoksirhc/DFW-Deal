@@ -1073,12 +1073,15 @@ def build_annual_cf(wb):
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
-    # Row 8: Expense Recoveries (= Total OpEx × recovery%)
-    # OpEx is on row 19 (computed below) — forward reference
-    ws.cell(row=8, column=1, value="Expense Recoveries (NNN)").font = FONT_CALC
+    # Row 8: Expense Recoveries — CAM + Utilities + Insurance + RE Taxes (EXCLUDING Mgmt Fee)
+    # Mgmt Fee is excluded to break the Recoveries<->Mgmt Fee<->EGR circular reference.
+    # Industry standard: mgmt fee is LL's cost, not reimbursed through CAM/NNN pool.
+    # Signs: CAM/Util/Ins/Tax are negative; -(neg) = positive recovery
+    ws.cell(row=8, column=1, value="Expense Recoveries (NNN, excl. mgmt fee)").font = FONT_CALC
     for i in range(11):
         col = get_column_letter(2 + i)
-        c = ws.cell(row=8, column=2 + i, value=f"=-{col}19*RecoveryPct")
+        c = ws.cell(row=8, column=2 + i,
+                    value=f"=-({col}14+{col}15+{col}17+{col}18)*RecoveryPct")
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
@@ -1451,29 +1454,30 @@ def build_monthly_cf(wb):
     c.number_format = FMT_DOLLAR
     style_calc(c)
 
-    # Row 13: Sale Proceeds (HoldMonths)
-    # Exit value = next year's NOI / ExitCap. Using FY32 NOI (year after exit).
-    # At HoldMonths = 60 (end of FY31), we sell — use FY32 NOI as exit NOI.
+    # Row 13: Sale Proceeds (net of sale costs) — only in HoldMonths
+    # Exit Value = next-year-NOI / ExitCap, using the FY immediately after HoldMonths.
+    # INT((HoldMonths-1)/12)+2 correctly identifies the NEXT fiscal year.
+    # Example: HoldMonths=60 → INT(59/12)+2 = 4+2 = 6 → INDEX col 6 = G = FY32 NOI ✓
     ws.cell(row=13, column=1, value="Sale Proceeds (net of sale costs)").font = FONT_CALC
-    # Only in the hold-exit month
     for i in range(120):
-        col = get_column_letter(2 + i)
-        # If month = HoldMonths: sell
-        # Exit Value = FY after exit / ExitCap — based on HoldMonths / 12
-        # For simplicity: Exit NOI = (HoldMonths+1)-th FY NOI
-        exit_formula = (f'IF({i+1}=HoldMonths,'
-                        f"(INDEX('Annual CF'!$B$21:$L$21,INT(HoldMonths/12)+1)/ExitCap)"
-                        f"*(1-DispCostPct),0)")
-        c = ws.cell(row=13, column=2 + i, value=f"={exit_formula}")
+        exit_formula = (
+            f"=IFERROR("
+            f"IF({i+1}=HoldMonths,"
+            f"(INDEX('Annual CF'!$B$21:$L$21,MIN(11,INT((HoldMonths-1)/12)+2))/ExitCap)"
+            f"*(1-DispCostPct),0),0)"
+        )
+        c = ws.cell(row=13, column=2 + i, value=exit_formula)
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
-    # Row 14: Loan Payoff at Exit
+    # Row 14: Loan Payoff at Exit (only in HoldMonths)
+    # MIN(60, HoldMonths) bounds the INDEX to valid amortization range
     ws.cell(row=14, column=1, value="Loan Payoff at Exit").font = FONT_CALC
     for i in range(120):
-        # If month = HoldMonths AND HoldMonths <= 60: payoff = Debt!G{21+HoldMonths}
-        # For flexibility: use INDEX on amortization End Balance column
-        formula = f"=IF({i+1}=HoldMonths,-INDEX(Debt!$G$22:$G$81,HoldMonths),0)"
+        formula = (
+            f"=IFERROR("
+            f"IF({i+1}=HoldMonths,-INDEX(Debt!$G$22:$G$81,MIN(60,HoldMonths)),0),0)"
+        )
         c = ws.cell(row=14, column=2 + i, value=formula)
         c.number_format = FMT_DOLLAR
         style_calc(c)
@@ -1552,8 +1556,8 @@ def build_summary(wb):
     kv(ws, 11, 1, "Acquisition Costs", "=PurchasePrice*AcqCostPct", FMT_DOLLAR)
     kv(ws, 12, 1, "Total Acquisition Cost", "=PurchasePrice*(1+AcqCostPct)", FMT_DOLLAR)
 
-    kv(ws, 14, 1, "Going-in Cap (on In-Place NOI)", "=InPlaceNOI/PurchasePrice", FMT_PCT)
-    kv(ws, 15, 1, "Going-in Cap (on FY27 NOI)", "='Annual CF'!B21/PurchasePrice", FMT_PCT)
+    kv(ws, 14, 1, "Going-in Cap (on In-Place NOI)", "=IFERROR(InPlaceNOI/PurchasePrice,0)", FMT_PCT)
+    kv(ws, 15, 1, "Going-in Cap (on FY27 NOI)", "=IFERROR('Annual CF'!B21/PurchasePrice,0)", FMT_PCT)
     kv(ws, 16, 1, "Exit Cap Rate", "=ExitCap", FMT_PCT)
 
     ws["A18"] = "FINANCING"
@@ -1561,8 +1565,8 @@ def build_summary(wb):
     kv(ws, 19, 1, "Loan Amount (70% LTV)", "=PurchasePrice*LTV", FMT_DOLLAR)
     kv(ws, 20, 1, "LTV", "=LTV", FMT_PCT)
     kv(ws, 21, 1, "All-in Rate (SOFR+300)", "=LoanRate", FMT_PCT)
-    kv(ws, 22, 1, "Debt Yield (on In-Place NOI)", "=InPlaceNOI/(PurchasePrice*LTV)", FMT_PCT)
-    kv(ws, 23, 1, "DSCR FY27 (NOI / Debt Service)", "='Annual CF'!B21/(-Debt!D87)", FMT_NUMBER_2DP)
+    kv(ws, 22, 1, "Debt Yield (on In-Place NOI)", "=IFERROR(InPlaceNOI/(PurchasePrice*LTV),0)", FMT_PCT)
+    kv(ws, 23, 1, "DSCR FY27 (NOI / Debt Service)", "=IFERROR('Annual CF'!B21/(-Debt!D87),0)", FMT_NUMBER_2DP)
 
     # SOURCES & USES
     ws["A25"] = "SOURCES & USES"
@@ -1607,31 +1611,36 @@ def build_summary(wb):
     ws["D18"] = "RETURNS"
     style_subheader(ws["D18"])
 
-    # Unlevered IRR: pull from Monthly CF row 17 (unlevered total CF)
-    # Need 121 months: 0 (if month 1 is period 0) through 120
-    # Use XIRR for accuracy
-    # Unlevered CF row 17 in Monthly CF, cols B:DQ (months 1-120)
+    # Unlevered IRR: IRR of Monthly CF row 17 from month 1 to HoldMonths.
+    # Annualize properly: (1+monthly_IRR)^12 - 1  (effective annual, not nominal × 12).
+    # IFERROR catches IRR convergence failures.
     kv(ws, 19, 4, "Unlevered IRR",
-       "=IRR('Monthly CF'!B17:OFFSET('Monthly CF'!B17,0,HoldMonths-1))*12", FMT_PCT,
-       highlight=True)
+       "=IFERROR((1+IRR('Monthly CF'!B17:INDEX('Monthly CF'!17:17,HoldMonths+1)))^12-1,0)",
+       FMT_PCT, highlight=True)
     kv(ws, 20, 4, "Levered IRR",
-       "=IRR('Monthly CF'!B18:OFFSET('Monthly CF'!B18,0,HoldMonths-1))*12", FMT_PCT,
-       highlight=True)
+       "=IFERROR((1+IRR('Monthly CF'!B18:INDEX('Monthly CF'!18:18,HoldMonths+1)))^12-1,0)",
+       FMT_PCT, highlight=True)
+    # Equity Multiple: Total distributions (including exit) / Initial equity
     kv(ws, 21, 4, "Equity Multiple (Levered)",
-       "=SUM(OFFSET('Monthly CF'!B18,0,0,1,HoldMonths))/(-B28)+1", FMT_MULT)
+       "=IFERROR(SUM('Monthly CF'!B18:INDEX('Monthly CF'!18:18,HoldMonths+1))/(-B28)+1,0)",
+       FMT_MULT)
+    # Avg CoC: sum of operating levered CFs (months 2 through HoldMonths-1, exclude acquisition M1 and exit)
     kv(ws, 22, 4, "Avg Cash-on-Cash (Levered)",
-       "=(SUM(OFFSET('Monthly CF'!B18,0,0,1,HoldMonths-1))-(-B28))/(-B28)/(HoldMonths/12)",
+       "=IFERROR(SUM('Monthly CF'!C18:INDEX('Monthly CF'!18:18,HoldMonths))/(-B28)/(HoldMonths/12-1/12),0)",
        FMT_PCT)
 
     ws["D24"] = "KEY METRICS"
     style_subheader(ws["D24"])
-    kv(ws, 25, 4, "FY27 Cap Rate (on purchase)", "='Annual CF'!B21/PurchasePrice", FMT_PCT)
-    kv(ws, 26, 4, "FY31 Cap Rate (exit year)", "='Annual CF'!F21/PurchasePrice", FMT_PCT)
+    kv(ws, 25, 4, "FY27 Cap Rate (on purchase)",
+       "=IFERROR('Annual CF'!B21/PurchasePrice,0)", FMT_PCT)
+    kv(ws, 26, 4, "FY31 Cap Rate (exit year)",
+       "=IFERROR('Annual CF'!F21/PurchasePrice,0)", FMT_PCT)
     kv(ws, 27, 4, "Peak Cash-on-Cash",
-       "=MAX('Annual CF'!B36:F36)/(-B28)", FMT_PCT)
+       "=IFERROR(MAX('Annual CF'!B36:F36)/(-B28),0)", FMT_PCT)
     kv(ws, 28, 4, "FY27 DSCR",
-       "='Annual CF'!B21/(-Debt!D87)", FMT_NUMBER_2DP)
-    kv(ws, 29, 4, "FY27 Debt Yield", "='Annual CF'!B21/(PurchasePrice*LTV)", FMT_PCT)
+       "=IFERROR('Annual CF'!B21/(-Debt!D87),0)", FMT_NUMBER_2DP)
+    kv(ws, 29, 4, "FY27 Debt Yield",
+       "=IFERROR('Annual CF'!B21/(PurchasePrice*LTV),0)", FMT_PCT)
 
     # Model integrity check — Model FY27 NOI vs OM FY27 NOI
     ws["A31"] = "MODEL INTEGRITY"
