@@ -1341,6 +1341,141 @@ def build_debt(wb):
         style_calc(acf.cell(row=34, column=2 + i))
 
 
+def build_monthly_cf(wb):
+    """Monthly CF tab — 120 months, Annual CF ÷ 12 with acquisition/sale timing."""
+    ws = wb["Monthly CF"] if "Monthly CF" in wb.sheetnames else wb.create_sheet("Monthly CF")
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "MONTHLY CASH FLOW — 120 months from AnalysisStart"
+    ws["A1"].font = FONT_TITLE
+
+    ws.column_dimensions["A"].width = 32
+    for i in range(120):
+        ws.column_dimensions[get_column_letter(2 + i)].width = 11
+
+    # Row 3: Month # (1-120)
+    ws.cell(row=3, column=1, value="Month #").font = FONT_SUBHEADER
+    for i in range(120):
+        c = ws.cell(row=3, column=2 + i, value=i + 1)
+        style_subheader(c)
+        c.alignment = Alignment(horizontal="center")
+
+    # Row 4: Date (label)
+    ws.cell(row=4, column=1, value="Month").font = FONT_SUBHEADER
+    for i in range(120):
+        c = ws.cell(row=4, column=2 + i, value=f"=EDATE(AnalysisStart,{i})")
+        c.number_format = FMT_DATE
+        c.alignment = Alignment(horizontal="center")
+
+    # Row 5: FY (derived: month 1-12 = FY27, 13-24 = FY28, etc.)
+    ws.cell(row=5, column=1, value="Fiscal Year").font = FONT_SUBHEADER
+    for i in range(120):
+        fy_num = 27 + (i // 12)
+        c = ws.cell(row=5, column=2 + i, value=f"FY{fy_num}")
+        c.alignment = Alignment(horizontal="center")
+
+    # Row 7: NOI (Annual / 12, straight-line)
+    ws.cell(row=7, column=1, value="NOI (Annual / 12)").font = FONT_CALC
+    for i in range(120):
+        fy_idx = i // 12  # 0-9
+        if fy_idx <= 10:  # FY27-FY37
+            col_acf = get_column_letter(2 + fy_idx)
+            c = ws.cell(row=7, column=2 + i, value=f"='Annual CF'!{col_acf}21/12")
+            c.number_format = FMT_DOLLAR
+            style_calc(c)
+
+    # Row 8: Capital (Annual / 12)
+    ws.cell(row=8, column=1, value="Capital Costs (Annual / 12)").font = FONT_CALC
+    for i in range(120):
+        fy_idx = i // 12
+        if fy_idx <= 10:
+            col_acf = get_column_letter(2 + fy_idx)
+            c = ws.cell(row=8, column=2 + i, value=f"='Annual CF'!{col_acf}26/12")
+            c.number_format = FMT_DOLLAR
+            style_calc(c)
+
+    # Row 9: Unlevered Operating CF
+    ws.cell(row=9, column=1, value="Operating Cash Flow").font = FONT_TOTAL
+    for i in range(120):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=9, column=2 + i, value=f"={col}7+{col}8")
+        c.number_format = FMT_DOLLAR
+        style_total(c)
+
+    # Row 11: Acquisition (Month 1)
+    ws.cell(row=11, column=1, value="Purchase Price + Closing Costs").font = FONT_CALC
+    c = ws.cell(row=11, column=2, value="=-PurchasePrice*(1+AcqCostPct)")
+    c.number_format = FMT_DOLLAR
+    style_calc(c)
+
+    # Row 12: Loan Proceeds (Month 1)
+    ws.cell(row=12, column=1, value="Loan Proceeds (net of orig fee)").font = FONT_CALC
+    c = ws.cell(row=12, column=2, value="=PurchasePrice*LTV*(1-LoanOrigFeePct)")
+    c.number_format = FMT_DOLLAR
+    style_calc(c)
+
+    # Row 13: Sale Proceeds (HoldMonths)
+    # Exit value = next year's NOI / ExitCap. Using FY32 NOI (year after exit).
+    # At HoldMonths = 60 (end of FY31), we sell — use FY32 NOI as exit NOI.
+    ws.cell(row=13, column=1, value="Sale Proceeds (net of sale costs)").font = FONT_CALC
+    # Only in the hold-exit month
+    for i in range(120):
+        col = get_column_letter(2 + i)
+        # If month = HoldMonths: sell
+        # Exit Value = FY after exit / ExitCap — based on HoldMonths / 12
+        # For simplicity: Exit NOI = (HoldMonths+1)-th FY NOI
+        exit_formula = (f'IF({i+1}=HoldMonths,'
+                        f"(INDEX('Annual CF'!$B$21:$L$21,INT(HoldMonths/12)+1)/ExitCap)"
+                        f"*(1-DispCostPct),0)")
+        c = ws.cell(row=13, column=2 + i, value=f"={exit_formula}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 14: Loan Payoff at Exit
+    ws.cell(row=14, column=1, value="Loan Payoff at Exit").font = FONT_CALC
+    for i in range(120):
+        # If month = HoldMonths AND HoldMonths <= 60: payoff = Debt!G{21+HoldMonths}
+        # For flexibility: use INDEX on amortization End Balance column
+        formula = f"=IF({i+1}=HoldMonths,-INDEX(Debt!$G$22:$G$81,HoldMonths),0)"
+        c = ws.cell(row=14, column=2 + i, value=formula)
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 15: Debt Service monthly
+    ws.cell(row=15, column=1, value="Debt Service (Monthly)").font = FONT_CALC
+    for i in range(120):
+        # Months 1-60: pull from Debt!F (Payment column) — negative (cash out)
+        if i < 60:
+            row_d = 22 + i
+            c = ws.cell(row=15, column=2 + i, value=f"=-Debt!F{row_d}")
+        else:
+            c = ws.cell(row=15, column=2 + i, value=0)
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 17: Unlevered Total CF
+    ws.cell(row=17, column=1, value="UNLEVERED CASH FLOW").font = FONT_TOTAL
+    for i in range(120):
+        col = get_column_letter(2 + i)
+        # Includes: operating CF + acquisition (month 1) + sale (hold month)
+        c = ws.cell(row=17, column=2 + i, value=f"={col}9+{col}11+{col}13")
+        c.number_format = FMT_DOLLAR
+        style_noi(c)
+
+    # Row 18: Levered Total CF
+    ws.cell(row=18, column=1, value="LEVERED CASH FLOW").font = FONT_TOTAL
+    for i in range(120):
+        col = get_column_letter(2 + i)
+        # Levered = Unlevered + Loan Proceeds (in) - Debt Service - Loan Payoff
+        c = ws.cell(row=18, column=2 + i, value=f"={col}17+{col}12+{col}15+{col}14")
+        c.number_format = FMT_DOLLAR
+        style_noi(c)
+
+    ws.freeze_panes = "B6"
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1365,12 +1500,13 @@ def main():
     build_rent_roll(wb, tenants)
     build_annual_cf(wb)
     build_debt(wb)
+    build_monthly_cf(wb)
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF, Debt (+ 2 placeholders)")
+    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF, Debt, Monthly CF (+ 1 placeholder)")
 
 
 if __name__ == "__main__":
