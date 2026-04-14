@@ -1476,6 +1476,137 @@ def build_monthly_cf(wb):
     ws.freeze_panes = "B6"
 
 
+def build_summary(wb):
+    """Summary tab — Deal overview, Sources & Uses, NOI bridge, Returns."""
+    ws = wb["Summary"] if "Summary" in wb.sheetnames else wb.create_sheet("Summary")
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "DEAL SUMMARY — DFW MODERN MULTI-TENANT PORTFOLIO"
+    ws["A1"].font = FONT_TITLE
+    ws.merge_cells("A1:F1")
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 4
+    ws.column_dimensions["D"].width = 34
+    ws.column_dimensions["E"].width = 18
+
+    # LEFT COLUMN: Deal Overview
+    ws["A3"] = "DEAL OVERVIEW"
+    style_subheader(ws["A3"])
+
+    def kv(ws, row, col, label, formula, fmt=None, highlight=False):
+        ws.cell(row=row, column=col, value=label).font = FONT_CALC
+        c = ws.cell(row=row, column=col + 1, value=formula)
+        if fmt:
+            c.number_format = fmt
+        if highlight:
+            style_noi(c)
+        else:
+            style_calc(c)
+
+    kv(ws, 4, 1, "Portfolio SF", "=PortfolioSF", FMT_NUMBER)
+    kv(ws, 5, 1, "# Properties", f"={len(PROPERTIES)}", "0")
+    kv(ws, 6, 1, "# Tenant Suites", "=COUNTA('Rent Roll'!C5:C166)", "0")
+    kv(ws, 7, 1, "Hold Period (Years)", "=HoldMonths/12", FMT_NUMBER_2DP)
+
+    kv(ws, 9, 1, "Purchase Price", "=PurchasePrice", FMT_DOLLAR, highlight=True)
+    kv(ws, 10, 1, "Price per SF", "=PurchasePrice/PortfolioSF", FMT_DOLLAR_CENTS)
+    kv(ws, 11, 1, "Acquisition Costs", "=PurchasePrice*AcqCostPct", FMT_DOLLAR)
+    kv(ws, 12, 1, "Total Acquisition Cost", "=PurchasePrice*(1+AcqCostPct)", FMT_DOLLAR)
+
+    kv(ws, 14, 1, "Going-in Cap (on In-Place NOI)", "=InPlaceNOI/PurchasePrice", FMT_PCT)
+    kv(ws, 15, 1, "Going-in Cap (on FY27 NOI)", "='Annual CF'!B21/PurchasePrice", FMT_PCT)
+    kv(ws, 16, 1, "Exit Cap Rate", "=ExitCap", FMT_PCT)
+
+    ws["A18"] = "FINANCING"
+    style_subheader(ws["A18"])
+    kv(ws, 19, 1, "Loan Amount (70% LTV)", "=PurchasePrice*LTV", FMT_DOLLAR)
+    kv(ws, 20, 1, "LTV", "=LTV", FMT_PCT)
+    kv(ws, 21, 1, "All-in Rate (SOFR+300)", "=LoanRate", FMT_PCT)
+    kv(ws, 22, 1, "Debt Yield (on In-Place NOI)", "=InPlaceNOI/(PurchasePrice*LTV)", FMT_PCT)
+    kv(ws, 23, 1, "DSCR FY27 (NOI / Debt Service)", "='Annual CF'!B21/(-Debt!D87)", FMT_NUMBER_2DP)
+
+    # SOURCES & USES
+    ws["A25"] = "SOURCES & USES"
+    style_subheader(ws["A25"])
+    ws.cell(row=26, column=1, value="SOURCES").font = FONT_SUBHEADER
+    kv(ws, 27, 1, "Loan Proceeds", "=PurchasePrice*LTV*(1-LoanOrigFeePct)", FMT_DOLLAR)
+    kv(ws, 28, 1, "Equity Required", "=B31-B27", FMT_DOLLAR, highlight=True)
+    ws.cell(row=29, column=1, value="Total Sources").font = FONT_TOTAL
+    c = ws.cell(row=29, column=2, value="=B27+B28")
+    style_total(c); c.number_format = FMT_DOLLAR
+
+    ws.cell(row=30, column=1, value="USES").font = FONT_SUBHEADER
+    kv(ws, 31, 1, "Purchase Price + Acq Costs", "=PurchasePrice*(1+AcqCostPct)", FMT_DOLLAR)
+    ws.cell(row=32, column=1, value="Total Uses").font = FONT_TOTAL
+    c = ws.cell(row=32, column=2, value="=B31")
+    style_total(c); c.number_format = FMT_DOLLAR
+
+    # RIGHT COLUMN: NOI Bridge + Returns
+    ws["D3"] = "NOI BRIDGE"
+    style_subheader(ws["D3"])
+    kv(ws, 4, 4, "In-Place NOI", "=InPlaceNOI", FMT_DOLLAR)
+    kv(ws, 5, 4, "FY27 NOI (Year 1)", "='Annual CF'!B21", FMT_DOLLAR)
+    kv(ws, 6, 4, "FY28 NOI (Year 2)", "='Annual CF'!C21", FMT_DOLLAR)
+    kv(ws, 7, 4, "FY31 NOI (Year 5 / Exit Year)", "='Annual CF'!F21", FMT_DOLLAR)
+    kv(ws, 8, 4, "FY32 NOI (Exit Year + 1)", "='Annual CF'!G21", FMT_DOLLAR)
+    kv(ws, 9, 4, "NOI Growth (Y1 → Y5)",
+       "=('Annual CF'!F21/'Annual CF'!B21)-1", FMT_PCT)
+
+    ws["D11"] = "EXIT"
+    style_subheader(ws["D11"])
+    kv(ws, 12, 4, "Exit Year NOI (next-year method)",
+       "=INDEX('Annual CF'!$B$21:$L$21,INT(HoldMonths/12)+1)", FMT_DOLLAR)
+    kv(ws, 13, 4, "Exit Value (Gross)",
+       "=E12/ExitCap", FMT_DOLLAR)
+    kv(ws, 14, 4, "Disposition Costs",
+       "=E13*DispCostPct", FMT_DOLLAR)
+    kv(ws, 15, 4, "Exit Value (Net)",
+       "=E13*(1-DispCostPct)", FMT_DOLLAR, highlight=True)
+    kv(ws, 16, 4, "Exit $/SF", "=E13/PortfolioSF", FMT_DOLLAR_CENTS)
+
+    # RETURNS
+    ws["D18"] = "RETURNS"
+    style_subheader(ws["D18"])
+
+    # Unlevered IRR: pull from Monthly CF row 17 (unlevered total CF)
+    # Need 121 months: 0 (if month 1 is period 0) through 120
+    # Use XIRR for accuracy
+    # Unlevered CF row 17 in Monthly CF, cols B:DQ (months 1-120)
+    kv(ws, 19, 4, "Unlevered IRR",
+       "=IRR('Monthly CF'!B17:OFFSET('Monthly CF'!B17,0,HoldMonths-1))*12", FMT_PCT,
+       highlight=True)
+    kv(ws, 20, 4, "Levered IRR",
+       "=IRR('Monthly CF'!B18:OFFSET('Monthly CF'!B18,0,HoldMonths-1))*12", FMT_PCT,
+       highlight=True)
+    kv(ws, 21, 4, "Equity Multiple (Levered)",
+       "=SUM(OFFSET('Monthly CF'!B18,0,0,1,HoldMonths))/(-B28)+1", FMT_MULT)
+    kv(ws, 22, 4, "Avg Cash-on-Cash (Levered)",
+       "=(SUM(OFFSET('Monthly CF'!B18,0,0,1,HoldMonths-1))-(-B28))/(-B28)/(HoldMonths/12)",
+       FMT_PCT)
+
+    ws["D24"] = "KEY METRICS"
+    style_subheader(ws["D24"])
+    kv(ws, 25, 4, "FY27 Cap Rate (on purchase)", "='Annual CF'!B21/PurchasePrice", FMT_PCT)
+    kv(ws, 26, 4, "FY31 Cap Rate (exit year)", "='Annual CF'!F21/PurchasePrice", FMT_PCT)
+    kv(ws, 27, 4, "Peak Cash-on-Cash",
+       "=MAX('Annual CF'!B36:F36)/(-B28)", FMT_PCT)
+    kv(ws, 28, 4, "FY27 DSCR",
+       "='Annual CF'!B21/(-Debt!D87)", FMT_NUMBER_2DP)
+    kv(ws, 29, 4, "FY27 Debt Yield", "='Annual CF'!B21/(PurchasePrice*LTV)", FMT_PCT)
+
+    # Change notes
+    ws["A35"] = ("Notes: Yellow cells on Assumptions tab are user inputs. Orange cells on "
+                 "Property Data = Plano estimates (OM incomplete). Exit uses the FY after "
+                 "HoldMonths (next-year NOI method). Levered IRR uses monthly IRR × 12.")
+    ws["A35"].font = Font(italic=True, size=9, color="606060")
+    ws.merge_cells("A35:E36")
+    ws["A35"].alignment = Alignment(wrap_text=True, vertical="top")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1501,12 +1632,20 @@ def main():
     build_annual_cf(wb)
     build_debt(wb)
     build_monthly_cf(wb)
+    build_summary(wb)
+
+    # Reorder tabs for UX: Summary first, then Assumptions, then the rest
+    desired_order = ["Summary", "Assumptions", "Property Data", "MLA", "Rent Roll",
+                     "Annual CF", "Monthly CF", "Debt"]
+    for idx, name in enumerate(desired_order):
+        if name in wb.sheetnames:
+            wb.move_sheet(name, offset=idx - wb.sheetnames.index(name))
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF, Debt, Monthly CF (+ 1 placeholder)")
+    print(f"  All 8 tabs built: Summary, Assumptions, Property Data, MLA, Rent Roll, Annual CF, Monthly CF, Debt")
 
 
 if __name__ == "__main__":
