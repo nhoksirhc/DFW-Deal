@@ -1196,6 +1196,151 @@ def build_annual_cf(wb):
     ws.freeze_panes = "B4"
 
 
+def build_debt(wb):
+    """Debt tab — loan sizing + monthly amortization schedule (60 months)."""
+    ws = wb["Debt"] if "Debt" in wb.sheetnames else wb.create_sheet("Debt")
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "DEBT MODULE — BANK FLOATING (SOFR + 300 bps, 70% LTV, 5-yr term)"
+    ws["A1"].font = FONT_TITLE
+
+    # Column widths
+    widths = [22, 16, 14, 14, 14, 14, 14]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[get_column_letter(i + 1)].width = w
+
+    # Loan Sizing summary (rows 3-12)
+    ws["A3"] = "LOAN SIZING"
+    style_subheader(ws["A3"])
+
+    sizing = [
+        ("Purchase Price", "=PurchasePrice", FMT_DOLLAR),
+        ("LTV", "=LTV", FMT_PCT),
+        ("Loan Amount", "=PurchasePrice*LTV", FMT_DOLLAR),
+        ("SOFR", "=SOFR", FMT_PCT),
+        ("Spread (bps)", "=LoanSpreadBps", "0"),
+        ("All-in Rate", "=LoanRate", FMT_PCT),
+        ("Amortization (months)", "=LoanAmortMonths", "0"),
+        ("I/O Period (months)", "=LoanIOMonths", "0"),
+        ("Term (months)", "=LoanTermMonths", "0"),
+        ("Origination Fee $", "=PurchasePrice*LTV*LoanOrigFeePct", FMT_DOLLAR),
+    ]
+    for i, (label, formula, fmt) in enumerate(sizing):
+        ws.cell(row=4 + i, column=1, value=label).font = FONT_CALC
+        c = ws.cell(row=4 + i, column=2, value=formula)
+        c.number_format = fmt
+        style_calc(c)
+
+    # Key debt metrics (rows 16-18)
+    ws["A16"] = "KEY METRICS"
+    style_subheader(ws["A16"])
+    # P&I payment at amort rate (payment formula)
+    ws.cell(row=17, column=1, value="Monthly P&I Payment (amort)").font = FONT_CALC
+    c = ws.cell(row=17, column=2,
+                value="=-PMT(LoanRate/12,LoanAmortMonths,PurchasePrice*LTV)")
+    c.number_format = FMT_DOLLAR
+    style_calc(c)
+    ws.cell(row=18, column=1, value="Monthly Interest-Only Payment").font = FONT_CALC
+    c = ws.cell(row=18, column=2, value="=PurchasePrice*LTV*LoanRate/12")
+    c.number_format = FMT_DOLLAR
+    style_calc(c)
+
+    # Amortization schedule
+    ws["A20"] = "AMORTIZATION SCHEDULE (60 monthly periods)"
+    style_subheader(ws["A20"])
+    headers = ["Month", "Beg Balance", "Rate (Annual)", "Interest", "Principal", "Payment", "End Balance"]
+    for i, h in enumerate(headers):
+        c = ws.cell(row=21, column=i + 1, value=h)
+        style_subheader(c)
+
+    # Rows 22-81: months 1-60
+    for m in range(1, 61):
+        r = 21 + m
+        ws.cell(row=r, column=1, value=m)
+        # Beg Balance: month 1 = loan amount; subsequent = previous end balance
+        if m == 1:
+            ws.cell(row=r, column=2, value="=PurchasePrice*LTV")
+        else:
+            ws.cell(row=r, column=2, value=f"=G{r-1}")
+        ws.cell(row=r, column=2).number_format = FMT_DOLLAR
+
+        # Rate (could be floating; for now constant. User can change SOFR)
+        ws.cell(row=r, column=3, value="=LoanRate").number_format = FMT_PCT
+        # Interest = Beg Balance × Rate/12
+        ws.cell(row=r, column=4, value=f"=B{r}*C{r}/12").number_format = FMT_DOLLAR
+        # Principal: 0 during I/O period, else payment - interest
+        ws.cell(row=r, column=5,
+                value=f"=IF({m}<=LoanIOMonths,0,F{r}-D{r})").number_format = FMT_DOLLAR
+        # Payment: I/O during I/O period, else P&I
+        ws.cell(row=r, column=6,
+                value=f"=IF({m}<=LoanIOMonths,D{r},$B$17)").number_format = FMT_DOLLAR
+        # End Balance = Beg - Principal
+        ws.cell(row=r, column=7, value=f"=B{r}-E{r}").number_format = FMT_DOLLAR
+
+        for col in range(1, 8):
+            cell = ws.cell(row=r, column=col)
+            cell.border = THIN_BORDER
+
+    # Payoff at maturity: end balance of month 60 (row 81)
+    ws["A83"] = "Loan Payoff at Maturity (Month 60)"
+    ws.cell(row=83, column=1).font = FONT_TOTAL
+    c = ws.cell(row=83, column=2, value="=G81")
+    style_total(c)
+    c.number_format = FMT_DOLLAR
+
+    # FY Interest and Principal summaries (for Annual CF linkage)
+    # FY27 = months 1-12, FY28 = months 13-24, etc.
+    # Model hold = 5 years (FY27-FY31), so only months 1-60 exist
+    ws["A85"] = "FY AGGREGATES (for Annual CF linkage)"
+    style_subheader(ws["A85"])
+    headers2 = ["Fiscal Year", "FY Interest", "FY Principal", "FY Debt Service", "EoY Balance"]
+    for i, h in enumerate(headers2):
+        c = ws.cell(row=86, column=i + 1, value=h)
+        style_subheader(c)
+
+    for i in range(11):  # FY27 through FY37
+        r = 87 + i
+        fy = 27 + i
+        ws.cell(row=r, column=1, value=f"FY{fy}")
+        if i < 5:  # FY27-FY31 (loan active)
+            start_row = 22 + i * 12  # row for month 1 of this FY
+            end_row = start_row + 11
+            ws.cell(row=r, column=2, value=f"=-SUM(D{start_row}:D{end_row})").number_format = FMT_DOLLAR
+            ws.cell(row=r, column=3, value=f"=-SUM(E{start_row}:E{end_row})").number_format = FMT_DOLLAR
+            ws.cell(row=r, column=4, value=f"=B{r}+C{r}").number_format = FMT_DOLLAR
+            ws.cell(row=r, column=5, value=f"=G{end_row}").number_format = FMT_DOLLAR
+        else:
+            # Loan has matured (or refinanced); no debt service
+            for col in range(2, 5):
+                ws.cell(row=r, column=col, value=0).number_format = FMT_DOLLAR
+            ws.cell(row=r, column=5, value=0).number_format = FMT_DOLLAR
+
+    ws.freeze_panes = "A22"
+
+    # Now wire these debt aggregates into Annual CF rows 31-34
+    acf = wb["Annual CF"]
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        # Row 31 Interest (from Debt!B{87+i})
+        acf.cell(row=31, column=2 + i, value=f"=Debt!B{87+i}").number_format = FMT_DOLLAR
+        style_calc(acf.cell(row=31, column=2 + i))
+        # Row 32 Principal
+        acf.cell(row=32, column=2 + i, value=f"=Debt!C{87+i}").number_format = FMT_DOLLAR
+        style_calc(acf.cell(row=32, column=2 + i))
+        # Row 33 Total Debt Service
+        acf.cell(row=33, column=2 + i, value=f"=Debt!D{87+i}").number_format = FMT_DOLLAR
+        style_calc(acf.cell(row=33, column=2 + i))
+        # Row 34 Loan Payoff — only in FY of loan maturity (FY31, index 4)
+        if i == 4:  # FY31 = end of year 5 = loan matures
+            acf.cell(row=34, column=2 + i,
+                     value="=-Debt!B83").number_format = FMT_DOLLAR
+        else:
+            acf.cell(row=34, column=2 + i, value=0).number_format = FMT_DOLLAR
+        style_calc(acf.cell(row=34, column=2 + i))
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1219,12 +1364,13 @@ def main():
     print(f"  Loaded {len(tenants)} tenant records from rent roll")
     build_rent_roll(wb, tenants)
     build_annual_cf(wb)
+    build_debt(wb)
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF (+ 3 placeholders)")
+    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF, Debt (+ 2 placeholders)")
 
 
 if __name__ == "__main__":
