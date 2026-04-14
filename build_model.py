@@ -463,8 +463,18 @@ RENT_ROLL_PATH = "/home/user/DFW-Deal/DFW Rent Roll 4.9.2026.xlsx"
 
 
 def add_named_range(wb, name, sheet_name, cell_ref):
-    """Register a workbook-scoped named range pointing to a single cell."""
-    ref = f"'{sheet_name}'!${cell_ref}"
+    """Register a workbook-scoped named range pointing to a single cell.
+    CRITICAL: Must use fully absolute reference ($col$row), otherwise Excel
+    shifts the row relative to the calling cell → #DIV/0! / wrong values.
+    """
+    import re as _re
+    m = _re.match(r'\$?([A-Z]+)\$?(\d+)', cell_ref)
+    if m:
+        col, row = m.groups()
+        absolute_ref = f"${col}${row}"
+    else:
+        absolute_ref = cell_ref  # fallback; shouldn't hit
+    ref = f"'{sheet_name}'!{absolute_ref}"
     dn = DefinedName(name=name, attr_text=ref)
     wb.defined_names[name] = dn
 
