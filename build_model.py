@@ -583,13 +583,10 @@ def build_assumptions(wb):
     inp("Parking Stabilized Utilization", "ParkingUtilStab", DEFAULTS["parking_utilization_stabilized"], FMT_PCT, "Target year 3+")
     inp("Tenant Upgrade Rent Growth", "TURentGrowth", DEFAULTS["tenant_upgrade_rent_growth"], FMT_PCT, "")
 
-    # Pricing
+    # Pricing — single direct input. Cap rate + $/SF are OUTPUTS on Summary.
     section("PRICING")
-    inp("Pricing Mode", "PricingMode", DEFAULTS["pricing_mode"], None,
-        "price_psf | cap_on_inplace | cap_on_y1 | price_direct")
-    inp("Price per SF (Mode: price_psf)", "PricePerSF", DEFAULTS["price_per_sf_input"], FMT_DOLLAR_CENTS, "Broker guidance $250/SF")
-    inp("Going-In Cap Rate (Mode: cap_on_*)", "TargetCap", DEFAULTS["target_going_in_cap"], FMT_PCT, "User spec: 8% on in-place NOI")
-    inp("Purchase Price Direct Input", "PricePriceDirect", DEFAULTS["purchase_price_input"], FMT_DOLLAR, "Only used if Mode = price_direct")
+    inp("Purchase Price ($)", "PurchasePrice", 107637500, FMT_DOLLAR,
+        "Total portfolio price — allocate across properties on Property Data tab")
     inp("Exit Cap Rate", "ExitCap", DEFAULTS["exit_cap_rate"], FMT_PCT, "User spec: 6.5%")
 
     # Transaction costs
@@ -618,35 +615,17 @@ def build_assumptions(wb):
     inp("Tier 2 IRR Hurdle", "Tier2Hurdle", DEFAULTS["tier2_hurdle_irr"], FMT_PCT, "")
     inp("Tier 3 GP Split (above)", "Tier3GPSplit", DEFAULTS["tier3_split_gp"], FMT_PCT, "")
 
-    # Derived: Purchase Price formula
-    section("DERIVED PRICING (calculated)")
-    # In-place NOI is computed on Property Data tab; we reference it here
-    calc("In-Place NOI (Portfolio)", "InPlaceNOI", "=SUM('Property Data'!B18:G18)", FMT_DOLLAR, "Sum across 6 properties")
-    calc("Portfolio SF", "PortfolioSF", "=SUM('Property Data'!B4:G4)", FMT_NUMBER, "")
-    calc("Purchase Price", "PurchasePrice",
-         '=IF(PricingMode="price_psf",PricePerSF*PortfolioSF,'
-         'IF(PricingMode="cap_on_inplace",InPlaceNOI/TargetCap,'
-         'IF(PricingMode="cap_on_y1",\'Annual CF\'!B21/TargetCap,'
-         'PricePriceDirect)))',
-         FMT_DOLLAR, "Resolves based on Pricing Mode")
-    calc("Price per SF (implied)", "PricePerSFImplied", "=PurchasePrice/PortfolioSF", FMT_DOLLAR_CENTS, "")
-    calc("Going-In Cap (on In-Place NOI)", "CapInPlace", "=InPlaceNOI/PurchasePrice", FMT_PCT, "")
+    # Derived portfolio-level totals (pulled from Property Data)
+    section("DERIVED TOTALS (calculated)")
+    calc("Portfolio SF", "PortfolioSF", "=SUM('Property Data'!$B$4:$G$4)", FMT_NUMBER, "")
+    calc("In-Place NOI (Portfolio)", "InPlaceNOI", "=SUM('Property Data'!$B$18:$G$18)", FMT_DOLLAR, "Sum across 6 properties")
+    calc("Price per SF (implied)", "PricePerSFImplied", "=IFERROR(PurchasePrice/PortfolioSF,0)", FMT_DOLLAR_CENTS, "Output: implied $/SF")
+    calc("Going-In Cap (on In-Place NOI)", "CapInPlace", "=IFERROR(InPlaceNOI/PurchasePrice,0)", FMT_PCT, "Output: implied going-in cap")
 
-    # Pricing Mode dropdown
-    dv_mode = DataValidation(
-        type="list",
-        formula1='"price_psf,cap_on_inplace,cap_on_y1,price_direct"',
-        allow_blank=False,
-    )
-    dv_mode.error = "Must be: price_psf, cap_on_inplace, cap_on_y1, or price_direct"
-    dv_mode.errorTitle = "Invalid Pricing Mode"
-    dv_mode.add("B41")  # PricingMode cell
-    ws.add_data_validation(dv_mode)
-
-    # TRUE/FALSE dropdowns for boolean inputs
+    # TRUE/FALSE dropdown for boolean inputs
     dv_bool = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=False)
     dv_bool.add("B35")  # ReassessTaxes
-    dv_bool.add("B59")  # WaterfallOn
+    dv_bool.add("B56")  # WaterfallOn (row shifted after pricing simplification)
     ws.add_data_validation(dv_bool)
 
 
@@ -730,6 +709,56 @@ def build_property_data(wb):
                 c.number_format = fmt
 
     ws.column_dimensions["H"].width = 16
+
+    # ---- PRICE ALLOCATION (rows 28-32) ----
+    ws.cell(row=28, column=1, value="PRICE ALLOCATION").font = FONT_SUBHEADER
+    style_subheader(ws.cell(row=28, column=1))
+
+    # Row 29: Allocation % — default to NOI-weighted; user can edit per-property to re-allocate
+    ws.cell(row=29, column=1, value="Allocation % (editable — default: NOI-weighted)").font = FONT_CALC
+    for i in range(len(PROPERTIES)):
+        col = get_column_letter(2 + i)
+        # Default formula: property in-place NOI / portfolio in-place NOI
+        c = ws.cell(row=29, column=2 + i, value=f"={col}18/$H$18")
+        c.number_format = FMT_PCT
+        style_input(c)  # yellow = editable override
+    # Sum check
+    c = ws.cell(row=29, column=8, value="=SUM(B29:G29)")
+    c.number_format = FMT_PCT
+    style_total(c)
+
+    # Row 30: Allocated Price ($) = Purchase Price × Allocation %
+    ws.cell(row=30, column=1, value="Allocated Price ($)").font = FONT_CALC
+    for i in range(len(PROPERTIES)):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=30, column=2 + i, value=f"=PurchasePrice*{col}29")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+    c = ws.cell(row=30, column=8, value="=SUM(B30:G30)")
+    c.number_format = FMT_DOLLAR
+    style_total(c)
+
+    # Row 31: Implied Cap Rate (Y1) — on in-place NOI
+    ws.cell(row=31, column=1, value="Implied Cap Rate (on In-Place NOI)").font = FONT_CALC
+    for i in range(len(PROPERTIES)):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=31, column=2 + i, value=f"=IFERROR({col}18/{col}30,0)")
+        c.number_format = FMT_PCT
+        style_calc(c)
+    c = ws.cell(row=31, column=8, value="=IFERROR($H$18/$H$30,0)")
+    c.number_format = FMT_PCT
+    style_total(c)
+
+    # Row 32: Implied $/SF
+    ws.cell(row=32, column=1, value="Implied $/SF").font = FONT_CALC
+    for i in range(len(PROPERTIES)):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=32, column=2 + i, value=f"=IFERROR({col}30/{col}4,0)")
+        c.number_format = FMT_DOLLAR_CENTS
+        style_calc(c)
+    c = ws.cell(row=32, column=8, value="=IFERROR($H$30/$H$4,0)")
+    c.number_format = FMT_DOLLAR_CENTS
+    style_total(c)
 
 
 def build_mla(wb):
@@ -1389,6 +1418,235 @@ def build_debt(wb):
         style_calc(acf.cell(row=34, column=2 + i))
 
 
+def build_property_cf(wb, prop_idx, prop):
+    """Per-property annual cash flow tab. Uses SUMIFS to pull tenant rent from
+    the Rent Roll by property name, and direct references to Property Data
+    columns for OpEx line items."""
+    sheet_name = f"CF - {prop['name']}"
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    # Column on Property Data = 2 + prop_idx (B..G)
+    pd_col = get_column_letter(2 + prop_idx)
+    prop_name = prop["name"]
+
+    ws["A1"] = f"{prop['name'].upper()} — ANNUAL CASH FLOW (FY Ending April 30)"
+    ws["A1"].font = FONT_TITLE
+
+    # Column widths
+    ws.column_dimensions["A"].width = 38
+    for i in range(11):
+        ws.column_dimensions[get_column_letter(2 + i)].width = 14
+    ws.column_dimensions["M"].width = 16
+
+    # FY header row
+    for i in range(11):
+        c = ws.cell(row=3, column=2 + i, value=f"FY{27 + i}")
+        style_subheader(c)
+        c.alignment = Alignment(horizontal="center")
+    c = ws.cell(row=3, column=13, value="Total")
+    style_subheader(c)
+
+    # Property meta info (rows 4-5)
+    ws.cell(row=4, column=1, value="Property SF").font = FONT_CALC
+    c = ws.cell(row=4, column=2, value=f"='Property Data'!{pd_col}4")
+    style_calc(c); c.number_format = FMT_NUMBER
+    ws.cell(row=4, column=4, value="Allocated Price").font = FONT_CALC
+    c = ws.cell(row=4, column=5, value=f"='Property Data'!{pd_col}30")
+    style_calc(c); c.number_format = FMT_DOLLAR
+    ws.cell(row=4, column=7, value="Implied Cap").font = FONT_CALC
+    c = ws.cell(row=4, column=8, value=f"='Property Data'!{pd_col}31")
+    style_calc(c); c.number_format = FMT_PCT
+    ws.cell(row=4, column=10, value="Implied $/SF").font = FONT_CALC
+    c = ws.cell(row=4, column=11, value=f"='Property Data'!{pd_col}32")
+    style_calc(c); c.number_format = FMT_DOLLAR_CENTS
+
+    # ---- REVENUE ----
+    ws.cell(row=6, column=1, value="REVENUE").font = FONT_SUBHEADER
+
+    # GPR: SUMIFS from Rent Roll for this property
+    # Rent Roll cols N–X = FY27–FY37 base rent; col A = Property name
+    ws.cell(row=7, column=1, value="Gross Potential Rent").font = FONT_CALC
+    for i in range(11):
+        rr_col = get_column_letter(14 + i)  # N..X
+        formula = f'=SUMIFS(\'Rent Roll\'!{rr_col}5:{rr_col}166,\'Rent Roll\'!$A$5:$A$166,"{prop_name}")'
+        c = ws.cell(row=7, column=2 + i, value=formula)
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 8: Vac & Credit
+    ws.cell(row=8, column=1, value="Less: Vacancy & Credit Loss").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=8, column=2 + i, value=f"=-{col}7*(GeneralVacancy+CreditLoss)")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 9: Expense Recoveries (excl mgmt fee, break circular)
+    ws.cell(row=9, column=1, value="Expense Recoveries (NNN, excl. mgmt fee)").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=9, column=2 + i,
+                    value=f"=-({col}15+{col}16+{col}18+{col}19)*RecoveryPct")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 10: Tenant Upgrade Rent (from Property Data row 25)
+    ws.cell(row=10, column=1, value="Tenant Upgrade Rent").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=10, column=2 + i,
+                    value=f"='Property Data'!{pd_col}$25*(1+TURentGrowth)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 11: Parking Rent (from Property Data row 26)
+    ws.cell(row=11, column=1, value="Parking Rent").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=11, column=2 + i,
+                    value=f"='Property Data'!{pd_col}$26*(1+GrowthOther)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 12: EGR
+    ws.cell(row=12, column=1, value="EFFECTIVE GROSS REVENUE").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=12, column=2 + i, value=f"=SUM({col}7:{col}11)")
+        style_total(c); c.number_format = FMT_DOLLAR
+
+    # ---- OPERATING EXPENSES ----
+    ws.cell(row=14, column=1, value="OPERATING EXPENSES").font = FONT_SUBHEADER
+
+    # Row 15: CAM
+    ws.cell(row=15, column=1, value="CAM").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=15, column=2 + i,
+                    value=f"=-'Property Data'!{pd_col}$20*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 16: Utilities
+    ws.cell(row=16, column=1, value="Utilities").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=16, column=2 + i,
+                    value=f"=-'Property Data'!{pd_col}$21*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 17: Mgmt Fee
+    ws.cell(row=17, column=1, value="Management Fee (% of EGR)").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=17, column=2 + i, value=f"=-{col}12*MgmtFeePct")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 18: Insurance
+    ws.cell(row=18, column=1, value="Insurance").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=18, column=2 + i,
+                    value=f"=-'Property Data'!{pd_col}$23*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 19: RE Taxes — reassessed on ALLOCATED price (not portfolio price) if ReassessTaxes
+    ws.cell(row=19, column=1, value="RE Taxes").font = FONT_CALC
+    for i in range(11):
+        # Reassessed: Allocated Price × property's millage, grown
+        # Base: property's OM FY27 tax, grown
+        reassessed = f"-'Property Data'!{pd_col}$30*'Property Data'!{pd_col}$16*(1+GrowthRETax)^{i}"
+        base = f"-'Property Data'!{pd_col}$24*(1+GrowthRETax)^{i}"
+        c = ws.cell(row=19, column=2 + i, value=f"=IF(ReassessTaxes,{reassessed},{base})")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 20: Total OpEx
+    ws.cell(row=20, column=1, value="TOTAL OPERATING EXPENSES").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=20, column=2 + i, value=f"=SUM({col}15:{col}19)")
+        style_total(c); c.number_format = FMT_DOLLAR
+
+    # Row 22: NOI
+    ws.cell(row=22, column=1, value="NET OPERATING INCOME (NOI)").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=22, column=2 + i, value=f"={col}12+{col}20")
+        style_noi(c); c.number_format = FMT_DOLLAR
+
+    # Row 24: Implied Cap Rate each year
+    ws.cell(row=24, column=1, value="Implied Cap Rate (NOI / Allocated Price)").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=24, column=2 + i,
+                    value=f"=IFERROR({col}22/'Property Data'!{pd_col}$30,0)")
+        c.number_format = FMT_PCT
+        style_calc(c)
+
+    # ---- CAPITAL COSTS ----
+    ws.cell(row=26, column=1, value="CAPITAL COSTS").font = FONT_SUBHEADER
+
+    # Row 27: TI + LC — SUMIFS from Rent Roll for this property (cols Y-AI)
+    ws.cell(row=27, column=1, value="Tenant Improvements & Leasing Commissions").font = FONT_CALC
+    for i in range(11):
+        rr_col = get_column_letter(25 + i)  # Y..AI
+        formula = f'=-SUMIFS(\'Rent Roll\'!{rr_col}5:{rr_col}166,\'Rent Roll\'!$A$5:$A$166,"{prop_name}")'
+        c = ws.cell(row=27, column=2 + i, value=formula)
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 28: Capital Reserves (property SF × $0.20 × CPI growth)
+    ws.cell(row=28, column=1, value="Capital Reserves").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=28, column=2 + i,
+                    value=f"=-ReservesPSF*'Property Data'!{pd_col}$4*(1+CPI)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 29: Total Cap
+    ws.cell(row=29, column=1, value="TOTAL CAPITAL").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=29, column=2 + i, value=f"=SUM({col}27:{col}28)")
+        style_total(c); c.number_format = FMT_DOLLAR
+
+    # Row 31: Unlevered CF
+    ws.cell(row=31, column=1, value="UNLEVERED CASH FLOW").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=31, column=2 + i, value=f"={col}22+{col}29")
+        style_noi(c); c.number_format = FMT_DOLLAR
+
+    # Totals column M
+    for r in [7, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 20, 22, 27, 28, 29, 31]:
+        c = ws.cell(row=r, column=13, value=f"=SUM(B{r}:L{r})")
+        c.number_format = FMT_DOLLAR
+        style_total(c) if r in (12, 20, 22, 29, 31) else style_calc(c)
+
+    # ---- EXIT (at HoldMonths) ----
+    ws.cell(row=33, column=1, value="EXIT").font = FONT_SUBHEADER
+    ws.cell(row=34, column=1, value="Exit Year NOI (next-year method)").font = FONT_CALC
+    c = ws.cell(row=34, column=2,
+                value="=INDEX(B22:L22,MIN(11,INT((HoldMonths-1)/12)+2))")
+    style_calc(c); c.number_format = FMT_DOLLAR
+    ws.cell(row=35, column=1, value="Exit Value (Gross)").font = FONT_CALC
+    c = ws.cell(row=35, column=2, value="=B34/ExitCap")
+    style_calc(c); c.number_format = FMT_DOLLAR
+    ws.cell(row=36, column=1, value="Exit Value (Net of 2% disp costs)").font = FONT_CALC
+    c = ws.cell(row=36, column=2, value="=B35*(1-DispCostPct)")
+    style_noi(c); c.number_format = FMT_DOLLAR
+    ws.cell(row=37, column=1, value="Profit (Net Exit − Allocated Price)").font = FONT_CALC
+    c = ws.cell(row=37, column=2, value=f"=B36-'Property Data'!{pd_col}30")
+    style_noi(c); c.number_format = FMT_DOLLAR
+    ws.cell(row=38, column=1, value="Exit $/SF").font = FONT_CALC
+    c = ws.cell(row=38, column=2, value=f"=B35/'Property Data'!{pd_col}4")
+    style_calc(c); c.number_format = FMT_DOLLAR_CENTS
+
+    ws.freeze_panes = "B4"
+
+
 def build_monthly_cf(wb):
     """Monthly CF tab — 120 months, Annual CF ÷ 12 with acquisition/sale timing."""
     ws = wb["Monthly CF"] if "Monthly CF" in wb.sheetnames else wb.create_sheet("Monthly CF")
@@ -1696,20 +1954,30 @@ def main():
     build_annual_cf(wb)
     build_debt(wb)
     build_monthly_cf(wb)
+
+    # 6 per-property cash flow tabs
+    for idx, prop in enumerate(PROPERTIES):
+        build_property_cf(wb, idx, prop)
+
     build_summary(wb)
 
-    # Reorder tabs for UX: Summary first, then Assumptions, then the rest
-    desired_order = ["Summary", "Assumptions", "Property Data", "MLA", "Rent Roll",
-                     "Annual CF", "Monthly CF", "Debt"]
+    # Reorder tabs for UX
+    prop_cf_names = [f"CF - {p['name']}" for p in PROPERTIES]
+    desired_order = (
+        ["Summary", "Assumptions", "Property Data", "MLA", "Rent Roll",
+         "Annual CF", "Monthly CF", "Debt"] + prop_cf_names
+    )
     for idx, name in enumerate(desired_order):
         if name in wb.sheetnames:
-            wb.move_sheet(name, offset=idx - wb.sheetnames.index(name))
+            current_idx = wb.sheetnames.index(name)
+            wb.move_sheet(name, offset=idx - current_idx)
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  All 8 tabs built: Summary, Assumptions, Property Data, MLA, Rent Roll, Annual CF, Monthly CF, Debt")
+    print(f"  All tabs built: Summary, Assumptions, Property Data, MLA, Rent Roll,")
+    print(f"                  Annual CF, Monthly CF, Debt + 6 per-property CF tabs")
 
 
 if __name__ == "__main__":
