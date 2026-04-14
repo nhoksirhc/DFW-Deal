@@ -704,6 +704,74 @@ def build_property_data(wb):
     ws.column_dimensions["H"].width = 16
 
 
+def build_mla(wb):
+    """Market Leasing Assumptions — per property + unit type (Shop/Studio)."""
+    ws = wb["MLA"] if "MLA" in wb.sheetnames else wb.create_sheet("MLA")
+    # Clear existing
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "MARKET LEASING ASSUMPTIONS"
+    ws["A1"].font = FONT_TITLE
+    ws["A2"] = "Defaults to OM values. Edit per property/unit type to override global assumptions."
+    ws["A2"].font = Font(italic=True, size=9, color="808080")
+
+    # Column widths
+    widths = [24, 12, 16, 14, 14, 14, 14, 14, 14, 14, 14, 14]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[get_column_letter(i + 1)].width = w
+
+    headers = [
+        "Property / Unit Type", "Unit Type", "Market Rent ($/SF)",
+        "Rent Growth", "In-Lease Escalator", "Lease Term (mo)",
+        "TI New $/SF", "TI Renewal $/SF", "LC New %", "LC Renewal %",
+        "Downtime New (mo)", "Retention %",
+    ]
+    for i, h in enumerate(headers):
+        c = ws.cell(row=4, column=i + 1, value=h)
+        style_subheader(c)
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+
+    # Build rows: Carrollton has Shop + Studio (different rents); others mostly unified
+    mla_rows = []
+    for p in PROPERTIES:
+        if p["market_rent_shop"] != p["market_rent_studio"]:
+            mla_rows.append((f"{p['name']} — Shop", p["id"], "Shop", p["market_rent_shop"]))
+            mla_rows.append((f"{p['name']} — Studio", p["id"], "Studio", p["market_rent_studio"]))
+        else:
+            mla_rows.append((f"{p['name']}", p["id"], "All", p["market_rent_shop"]))
+
+    for r_idx, (label, pid, unit_type, market_rent) in enumerate(mla_rows):
+        row = 5 + r_idx
+        ws.cell(row=row, column=1, value=label).font = FONT_CALC
+        ws.cell(row=row, column=2, value=unit_type).font = FONT_CALC
+
+        # All MLA fields default from Assumptions but overrideable per row
+        cells = [
+            (3, market_rent, FMT_DOLLAR_CENTS, True),          # Market Rent
+            (4, "=GrowthMarketRent", FMT_PCT, False),          # Rent Growth
+            (5, "=EscalatorInLease", FMT_PCT, False),          # In-Lease Escalator
+            (6, "=LeaseTermMonths", "0", False),               # Lease Term
+            (7, "=TINew", FMT_DOLLAR_CENTS, False),
+            (8, "=TIRenewal", FMT_DOLLAR_CENTS, False),
+            (9, "=LCNew", FMT_PCT, False),
+            (10, "=LCRenewal", FMT_PCT, False),
+            (11, "=DowntimeNew", "0", False),
+            (12, "=Retention", FMT_PCT, False),
+        ]
+        for col, val, fmt, is_input in cells:
+            c = ws.cell(row=row, column=col, value=val)
+            if is_input:
+                style_input(c)
+            else:
+                style_calc(c)
+            c.number_format = fmt
+
+    # Store row count for later lookups
+    ws["A1"].comment = Comment(f"MLA data rows 5 to {4 + len(mla_rows)}", "model")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -715,19 +783,19 @@ def main():
 
     build_assumptions(wb)
     build_property_data(wb)
-    # (Remaining tabs added in subsequent steps)
 
-    # For steps that reference later tabs, we need placeholder sheets so the
-    # formulas don't error on save. Add empty placeholders now.
+    # Placeholder sheets for tabs not yet built (so cross-refs don't error)
     for tab in ("MLA", "Rent Roll", "Annual CF", "Debt", "Monthly CF", "Summary"):
         if tab not in wb.sheetnames:
             wb.create_sheet(tab)
+
+    build_mla(wb)
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data (+ 6 placeholder tabs)")
+    print(f"  Tabs built: Assumptions, Property Data, MLA (+ 5 placeholders)")
 
 
 if __name__ == "__main__":
