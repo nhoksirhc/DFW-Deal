@@ -992,6 +992,210 @@ def build_rent_roll(wb, tenants):
     ws.freeze_panes = "N5"
 
 
+def build_annual_cf(wb):
+    """Annual CF tab — FY27-FY37 portfolio cash flow rollup."""
+    ws = wb["Annual CF"] if "Annual CF" in wb.sheetnames else wb.create_sheet("Annual CF")
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "ANNUAL CASH FLOW — PORTFOLIO (FY Ending April 30)"
+    ws["A1"].font = FONT_TITLE
+
+    # Column setup: A = Line Item, B-L = FY27-FY37 (11 years), M = Total
+    ws.column_dimensions["A"].width = 38
+    for i in range(11):
+        ws.column_dimensions[get_column_letter(2 + i)].width = 15
+    ws.column_dimensions["M"].width = 16
+
+    # Header row
+    for i in range(11):
+        c = ws.cell(row=3, column=2 + i, value=f"FY{27 + i}")
+        style_subheader(c)
+        c.alignment = Alignment(horizontal="center")
+    c = ws.cell(row=3, column=13, value="Total")
+    style_subheader(c)
+
+    # ---- REVENUE ----
+    ws.cell(row=5, column=1, value="REVENUE").font = FONT_SUBHEADER
+
+    # Row 6: Gross Potential Rent (sum of all Rent Roll base rent columns)
+    ws.cell(row=6, column=1, value="Gross Potential Rent").font = FONT_CALC
+    for i in range(11):
+        col_letter_rr = get_column_letter(14 + i)  # N-X on Rent Roll
+        c = ws.cell(row=6, column=2 + i,
+                    value=f"='Rent Roll'!{col_letter_rr}167")  # total row on Rent Roll
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 7: Vacancy + Credit Loss
+    ws.cell(row=7, column=1, value="Less: Vacancy & Credit Loss").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=7, column=2 + i, value=f"=-{col}6*(GeneralVacancy+CreditLoss)")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 8: Expense Recoveries (= Total OpEx × recovery%)
+    # OpEx is on row 19 (computed below) — forward reference
+    ws.cell(row=8, column=1, value="Expense Recoveries (NNN)").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=8, column=2 + i, value=f"=-{col}19*RecoveryPct")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 9: Tenant Upgrade Rent (portfolio FY27 base, grown)
+    ws.cell(row=9, column=1, value="Tenant Upgrade Rent").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=9, column=2 + i,
+                    value=f"='Property Data'!H26*(1+TURentGrowth)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 10: Parking Rent (portfolio FY27 base, grown)
+    ws.cell(row=10, column=1, value="Parking Rent").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=10, column=2 + i,
+                    value=f"='Property Data'!H27*(1+GrowthOther)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 11: Effective Gross Revenue
+    ws.cell(row=11, column=1, value="EFFECTIVE GROSS REVENUE (EGR)").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=11, column=2 + i, value=f"=SUM({col}6:{col}10)")
+        style_total(c)
+        c.number_format = FMT_DOLLAR
+
+    # ---- OPERATING EXPENSES ----
+    ws.cell(row=13, column=1, value="OPERATING EXPENSES").font = FONT_SUBHEADER
+
+    # Row 14: CAM (from Property Data H20, grown at OpEx)
+    ws.cell(row=14, column=1, value="CAM").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=14, column=2 + i,
+                    value=f"=-'Property Data'!H20*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 15: Utilities
+    ws.cell(row=15, column=1, value="Utilities").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=15, column=2 + i,
+                    value=f"=-'Property Data'!H21*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 16: Management Fee (4% of EGR)
+    ws.cell(row=16, column=1, value="Management Fee").font = FONT_CALC
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=16, column=2 + i, value=f"=-{col}11*MgmtFeePct")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 17: Insurance
+    ws.cell(row=17, column=1, value="Insurance").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=17, column=2 + i,
+                    value=f"=-'Property Data'!H23*(1+GrowthOpEx)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 18: RE Taxes (either OM base grown, OR reassessed at purchase × millage × weighted avg)
+    ws.cell(row=18, column=1, value="RE Taxes").font = FONT_CALC
+    for i in range(11):
+        # If reassess: portfolio weighted-avg millage × purchase price, grown at RE tax growth
+        # Else: OM FY27 base grown at RE tax growth
+        # Weighted-avg millage on Property Data row 17 (millage rate)
+        reassessed = (f"-(PurchasePrice*SUMPRODUCT('Property Data'!B4:G4,"
+                      f"'Property Data'!B17:G17)/PortfolioSF)*(1+GrowthRETax)^{i}")
+        base = f"-'Property Data'!H24*(1+GrowthRETax)^{i}"
+        c = ws.cell(row=18, column=2 + i, value=f"=IF(ReassessTaxes,{reassessed},{base})")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 19: Total OpEx
+    ws.cell(row=19, column=1, value="TOTAL OPERATING EXPENSES").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=19, column=2 + i, value=f"=SUM({col}14:{col}18)")
+        style_total(c)
+        c.number_format = FMT_DOLLAR
+
+    # Row 21: NOI
+    ws.cell(row=21, column=1, value="NET OPERATING INCOME (NOI)").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=21, column=2 + i, value=f"={col}11+{col}19")
+        style_noi(c)
+        c.number_format = FMT_DOLLAR
+
+    # ---- CAPITAL COSTS ----
+    ws.cell(row=23, column=1, value="CAPITAL COSTS").font = FONT_SUBHEADER
+
+    # Row 24: Tenant Improvements & Leasing Commissions (from Rent Roll capital cols Y-AI)
+    ws.cell(row=24, column=1, value="Tenant Improvements & Leasing Commissions").font = FONT_CALC
+    for i in range(11):
+        cap_col_letter = get_column_letter(25 + i)  # Y = 25, AI = 35
+        c = ws.cell(row=24, column=2 + i,
+                    value=f"=-'Rent Roll'!{cap_col_letter}167")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 25: Capital Reserves
+    ws.cell(row=25, column=1, value="Capital Reserves").font = FONT_CALC
+    for i in range(11):
+        c = ws.cell(row=25, column=2 + i,
+                    value=f"=-ReservesPSF*PortfolioSF*(1+CPI)^{i}")
+        c.number_format = FMT_DOLLAR
+        style_calc(c)
+
+    # Row 26: Total Capital
+    ws.cell(row=26, column=1, value="TOTAL CAPITAL").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=26, column=2 + i, value=f"=SUM({col}24:{col}25)")
+        style_total(c)
+        c.number_format = FMT_DOLLAR
+
+    # Row 28: UNLEVERED CASH FLOW
+    ws.cell(row=28, column=1, value="UNLEVERED CASH FLOW").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=28, column=2 + i, value=f"={col}21+{col}26")
+        style_noi(c)
+        c.number_format = FMT_DOLLAR
+
+    # ---- DEBT SERVICE (populated by Debt tab in Step 6) ----
+    ws.cell(row=30, column=1, value="DEBT SERVICE").font = FONT_SUBHEADER
+    ws.cell(row=31, column=1, value="Interest").font = FONT_CALC
+    ws.cell(row=32, column=1, value="Principal").font = FONT_CALC
+    ws.cell(row=33, column=1, value="Total Debt Service").font = FONT_CALC
+    ws.cell(row=34, column=1, value="Loan Payoff at Maturity").font = FONT_CALC
+
+    # Row 36: Levered Cash Flow (placeholder — will sum after Debt tab is built)
+    ws.cell(row=36, column=1, value="LEVERED CASH FLOW").font = FONT_TOTAL
+    for i in range(11):
+        col = get_column_letter(2 + i)
+        c = ws.cell(row=36, column=2 + i, value=f"={col}28+{col}33+{col}34")
+        style_noi(c)
+        c.number_format = FMT_DOLLAR
+
+    # Totals column (M) — sum across years for stacking line items (NOI, CF, etc.)
+    for r in [6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 21, 24, 25, 26, 28, 31, 32, 33, 34, 36]:
+        c = ws.cell(row=r, column=13, value=f"=SUM(B{r}:L{r})")
+        c.number_format = FMT_DOLLAR
+        if r in (11, 19, 21, 26, 28, 36):
+            style_total(c)
+        else:
+            style_calc(c)
+
+    ws.freeze_panes = "B4"
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1014,12 +1218,13 @@ def main():
     tenants = load_rent_roll(RENT_ROLL_PATH)
     print(f"  Loaded {len(tenants)} tenant records from rent roll")
     build_rent_roll(wb, tenants)
+    build_annual_cf(wb)
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll (+ 4 placeholders)")
+    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll, Annual CF (+ 3 placeholders)")
 
 
 if __name__ == "__main__":
