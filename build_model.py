@@ -772,6 +772,226 @@ def build_mla(wb):
     ws["A1"].comment = Comment(f"MLA data rows 5 to {4 + len(mla_rows)}", "model")
 
 
+def build_rent_roll(wb, tenants):
+    """Rent Roll tab — 162 tenants with FY27-FY37 annual rent + TI/LC formulas.
+
+    Column layout:
+      A Property  B Suite  C Tenant  D SF  E Lease Start  F Lease End
+      G In-Place PSF  H Market PSF  I Treatment  J Unit Type  K Status  L Notes
+      M YearsInLeaseAtStart (helper)
+      N-X  FY27-FY37 annual base rent (11 cols)
+      Y-AI FY27-FY37 TI+LC capital (11 cols)
+      AJ-AT FY27-FY37 Downtime Loss ($ reduction) (11 cols)
+    """
+    ws = wb["Rent Roll"] if "Rent Roll" in wb.sheetnames else wb.create_sheet("Rent Roll")
+    for row in ws.iter_rows():
+        for c in row:
+            c.value = None
+
+    ws["A1"] = "RENT ROLL (162 tenant-suites) — FY27–FY37 dynamic base rent & capital"
+    ws["A1"].font = FONT_TITLE
+    ws["A2"] = ("Formulas apply Treatment flag (Market/Option/Vacate/LeaseUp) per tenant. "
+                "Market Rent PSF (col H) is looked up from MLA tab. Edit Treatment col to switch scenarios.")
+    ws["A2"].font = Font(italic=True, size=9, color="808080")
+
+    # Column widths
+    for i, w in enumerate([13, 8, 34, 8, 12, 12, 10, 10, 11, 9, 10, 40, 10] + [11] * 33):
+        ws.column_dimensions[get_column_letter(i + 1)].width = w
+
+    # Headers
+    HEADER_ROW = 4
+    base_headers = [
+        "Property", "Suite", "Tenant", "SF", "Lease Start", "Lease End",
+        "In-Place PSF", "Market PSF", "Treatment", "Unit Type", "Status", "Notes",
+        "YrsAtStart",
+    ]
+    for i, h in enumerate(base_headers):
+        c = ws.cell(row=HEADER_ROW, column=i + 1, value=h)
+        style_subheader(c)
+
+    # FY columns: FY27 thru FY37 = 11 fiscal years
+    fy_labels = [f"FY{27 + i}" for i in range(11)]  # FY27 - FY37
+    # Three blocks: Base Rent, TI+LC, Downtime Loss
+    blocks = [("BaseRent", 14), ("Capital", 25), ("Downtime", 36)]  # starting cols
+    for block_name, start_col in blocks:
+        for i, label in enumerate(fy_labels):
+            c = ws.cell(row=HEADER_ROW, column=start_col + i, value=f"{block_name} {label}")
+            style_subheader(c)
+            c.alignment = Alignment(horizontal="center", wrap_text=True)
+
+    # Parse a "Mon-YYYY" string to an actual date (first of month)
+    def parse_date(s):
+        if s is None or s == "":
+            return None
+        if isinstance(s, dt.datetime):
+            return s.date()
+        if isinstance(s, dt.date):
+            return s
+        try:
+            return dt.datetime.strptime(s, "%b-%Y").date()
+        except Exception:
+            return None
+
+    # Write tenant rows
+    for r_idx, t in enumerate(tenants):
+        row = HEADER_ROW + 1 + r_idx
+        ws.cell(row=row, column=1, value=t["Property"])
+        ws.cell(row=row, column=2, value=str(t["Suite"]))
+        ws.cell(row=row, column=3, value=t["Tenant"])
+        ws.cell(row=row, column=4, value=t["SF"]).number_format = FMT_NUMBER
+        ls = parse_date(t["Lease Start"])
+        le = parse_date(t["Lease End"])
+        if ls:
+            c = ws.cell(row=row, column=5, value=ls)
+            c.number_format = FMT_DATE
+        if le:
+            c = ws.cell(row=row, column=6, value=le)
+            c.number_format = FMT_DATE
+        c = ws.cell(row=row, column=7, value=t["Rent PSF"] or 0)
+        c.number_format = FMT_DOLLAR_CENTS
+
+        # Market PSF lookup via VLOOKUP on MLA tab (property name or "Property — Shop/Studio")
+        # Build the lookup key: if Carrollton, use "Carrollton — {UnitType}"; else just property name
+        prop_name = t["Property"]
+        unit_type = t["UnitType"]
+        if prop_name == "Carrollton":
+            lookup_key = f'"Carrollton — "&J{row}'
+            market_formula = f'=VLOOKUP("Carrollton — "&J{row},MLA!$A$5:$L$11,3,FALSE)'
+        else:
+            market_formula = f'=VLOOKUP(A{row},MLA!$A$5:$L$11,3,FALSE)'
+        c = ws.cell(row=row, column=8, value=market_formula)
+        c.number_format = FMT_DOLLAR_CENTS
+        style_calc(c)
+
+        ws.cell(row=row, column=9, value=t["Treatment"])  # editable
+        style_input(ws.cell(row=row, column=9))
+        ws.cell(row=row, column=10, value=unit_type)
+        ws.cell(row=row, column=11, value=t["Status"])
+        ws.cell(row=row, column=12, value=t.get("Notes") or "")
+
+        # Helper: years between analysis_start and lease_start (negative if future)
+        # We use: =IF(E5="",0, (AnalysisStart - E5) / 365.25)
+        c = ws.cell(row=row, column=13, value=f'=IF(E{row}="",0,(AnalysisStart-E{row})/365.25)')
+        c.number_format = FMT_NUMBER_2DP
+        style_calc(c)
+
+        # FY27-FY37 Base Rent formulas (cols N-X = 14-24)
+        # Strategy:
+        #   fy_offset = i (0 for FY27, 10 for FY37)
+        #   fy_mid_date = DATE(2026+i+1, 10, 31)  # mid-point of FY (Oct 31)
+        #   fy_start_date = DATE(2026+i, 5, 1)
+        #   fy_end_date = DATE(2026+i+1, 4, 30)
+        #   in_lease = LeaseEnd >= fy_end_date AND LeaseStart <= fy_start_date  (full year)
+        #   expired = LeaseEnd < fy_start_date
+        #
+        # Formula (simplified; handles the common cases):
+        #   IF lease active full FY:
+        #     InPlacePSF * SF * (1+Escalator)^(fy_offset + YrsAtStart)
+        #   ELSEIF expired before FY:
+        #     post-expiry logic based on Treatment
+        #   ELSE (lease expires mid-FY or starts mid-FY):
+        #     prorated: (months_in_lease/12 * in_place_grown) + (months_post/12 * post_expiry)
+
+        for i in range(11):
+            col = 14 + i
+            fy_offset = i
+            # Excel date serials for FY start/end/mid
+            fy_start_ref = f'DATE(2026+{i},5,1)'
+            fy_end_ref = f'DATE(2027+{i},4,30)'
+            fy_mid_ref = f'DATE(2026+{i},10,31)'
+
+            # In-place rent grown at escalator
+            in_place_grown = f'G{row}*D{row}*(1+EscalatorInLease)^({fy_offset}+M{row})'
+
+            # Post-expiry rent per treatment
+            # Years since expiration at FY midpoint (negative if not yet expired)
+            yrs_since_expiry = f'({fy_mid_ref}-F{row})/365.25'
+
+            # Vacate: full market rent in all years post-expiry, with downtime in first year
+            vacate = (f'H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
+                      f'*IF(INT({yrs_since_expiry})=0,(12-DowntimeNew)/12,1)')
+            # Option: in-place × 1.025 × SF grown at 2.5% from expiry (roughly model as grown at escalator forward)
+            option = f'G{row}*D{row}*1.025*(1+EscalatorInLease)^{fy_offset}'
+            # Market: weighted retention × in-place-rollforward + (1-ret) × market new
+            market = (f'Retention*{in_place_grown}'
+                      f'+(1-Retention)*H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
+                      f'*IF(INT({yrs_since_expiry})=0,(12-DowntimeNew)/12,1)')
+            # LeaseUp: market rent × (1 - downtime/12) in Year 1, then full market thereafter
+            lease_up = (f'H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
+                        f'*IF({fy_offset}=0,(12-DowntimeNew)/12,1)')
+
+            # Pick post-expiry rent based on Treatment
+            post_expiry = (f'IF(I{row}="Vacate",{vacate},'
+                           f'IF(I{row}="Option",{option},'
+                           f'IF(I{row}="Market",{market},'
+                           f'IF(I{row}="LeaseUp",{lease_up},0))))')
+
+            # Main formula: piecewise based on where lease ends relative to FY
+            formula = (
+                f'=IFERROR('
+                f'IF(I{row}="LeaseUp",{lease_up},'
+                f'IF(F{row}="",0,'
+                f'IF(F{row}>={fy_end_ref},{in_place_grown},'
+                f'IF(F{row}<{fy_start_ref},{post_expiry},'
+                # Lease ends mid-FY: prorate
+                f'((F{row}-{fy_start_ref})/365.25)*{in_place_grown}'
+                f'+(({fy_end_ref}-F{row})/365.25)*{post_expiry}'
+                f')))),0)'
+            )
+            c = ws.cell(row=row, column=col, value=formula)
+            c.number_format = FMT_DOLLAR
+            style_calc(c)
+
+        # FY27-FY37 Capital (TI + LC) — hits only in the FY the lease expires (rolls over)
+        # If treatment = LeaseUp → hits in FY27 (Year 1, lease-up)
+        for i in range(11):
+            col = 25 + i
+            fy_offset = i
+            fy_start_ref = f'DATE(2026+{i},5,1)'
+            fy_end_ref = f'DATE(2027+{i},4,30)'
+
+            # Did the lease expire within this FY? Or for LeaseUp, is this FY27?
+            # Expected new rent at that time (for LC % calc)
+            new_rent_at_rollover = f'H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
+            # Blended TI (75% renewal × 0 + 25% new × 1.50 = ~$0.38 weighted)
+            ti_cost = (f'IF(I{row}="Vacate",TINew*D{row},'
+                       f'IF(I{row}="Market",Retention*TIRenewal*D{row}+(1-Retention)*TINew*D{row},'
+                       f'IF(I{row}="LeaseUp",TINew*D{row},'
+                       f'IF(I{row}="Option",TIRenewal*D{row},0))))')
+            lc_cost = (f'IF(I{row}="Vacate",LCNew*{new_rent_at_rollover},'
+                       f'IF(I{row}="Market",Retention*LCRenewal*{new_rent_at_rollover}+(1-Retention)*LCNew*{new_rent_at_rollover},'
+                       f'IF(I{row}="LeaseUp",LCNew*{new_rent_at_rollover},'
+                       f'IF(I{row}="Option",LCRenewal*{new_rent_at_rollover},0))))')
+
+            cap_formula = (
+                f'=IFERROR('
+                f'IF(AND(I{row}="LeaseUp",{fy_offset}=0),({ti_cost})+({lc_cost}),'
+                f'IF(F{row}="",0,'
+                f'IF(AND(F{row}>={fy_start_ref},F{row}<={fy_end_ref}),({ti_cost})+({lc_cost}),0)))'
+                f',0)'
+            )
+            c = ws.cell(row=row, column=col, value=cap_formula)
+            c.number_format = FMT_DOLLAR
+            style_calc(c)
+
+    # Total rows at bottom
+    total_row = HEADER_ROW + 1 + len(tenants)
+    ws.cell(row=total_row, column=1, value="PORTFOLIO TOTAL").font = FONT_TOTAL
+    for col in range(4, 5):  # SF
+        cref = f'{get_column_letter(col)}{HEADER_ROW + 1}:{get_column_letter(col)}{total_row - 1}'
+        c = ws.cell(row=total_row, column=col, value=f'=SUM({cref})')
+        style_total(c)
+        c.number_format = FMT_NUMBER
+    for col in range(14, 47):  # Base rent + capital columns
+        cref = f'{get_column_letter(col)}{HEADER_ROW + 1}:{get_column_letter(col)}{total_row - 1}'
+        c = ws.cell(row=total_row, column=col, value=f'=SUM({cref})')
+        style_total(c)
+        c.number_format = FMT_DOLLAR
+
+    # Freeze panes
+    ws.freeze_panes = "N5"
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -791,11 +1011,15 @@ def main():
 
     build_mla(wb)
 
+    tenants = load_rent_roll(RENT_ROLL_PATH)
+    print(f"  Loaded {len(tenants)} tenant records from rent roll")
+    build_rent_roll(wb, tenants)
+
     wb.save(OUTPUT_PATH)
     print(f"✓ Model saved: {OUTPUT_PATH}")
     print(f"  Portfolio SF: {PORTFOLIO_SF:,}")
     print(f"  OM FY27 NOI (sum): ${PORTFOLIO_FY27_NOI:,.0f}")
-    print(f"  Tabs built: Assumptions, Property Data, MLA (+ 5 placeholders)")
+    print(f"  Tabs built: Assumptions, Property Data, MLA, Rent Roll (+ 4 placeholders)")
 
 
 if __name__ == "__main__":
