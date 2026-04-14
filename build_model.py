@@ -33,6 +33,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, NamedSty
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.comments import Comment
+from openpyxl.worksheet.datavalidation import DataValidation
 
 # =============================================================================
 # SECTION 1 — STATIC DATA EXTRACTED FROM OMs
@@ -201,8 +202,8 @@ PROPERTIES = [
         "fy27_mgmt_fee": 88000,  # ~4% of EGR estimate
         "fy27_insurance": 80650,  # $0.98/SF × 82,250
         "fy27_re_taxes": 290000,  # ESTIMATED (if reassessment off)
-        "fy27_noi_om": 1400000,  # ESTIMATED
-        "inplace_noi": 1318936,  # from rent roll gross rent (proxy)
+        "fy27_noi_om": 1100000,   # REVISED: proper NOI estimate (was gross rent)
+        "inplace_noi": 1050000,   # REVISED: ~Frisco 68% op margin × implied EGR
         "tenant_upgrade_rent_fy27": 80000,  # ESTIMATED
         "parking_rent_fy27": 35000,  # ESTIMATED
         "parking_utilization_fy27": 0.80,  # ESTIMATED
@@ -615,11 +616,28 @@ def build_assumptions(wb):
     calc("Purchase Price", "PurchasePrice",
          '=IF(PricingMode="price_psf",PricePerSF*PortfolioSF,'
          'IF(PricingMode="cap_on_inplace",InPlaceNOI/TargetCap,'
-         'IF(PricingMode="cap_on_y1",\'Annual CF\'!C24/TargetCap,'
+         'IF(PricingMode="cap_on_y1",\'Annual CF\'!B21/TargetCap,'
          'PricePriceDirect)))',
          FMT_DOLLAR, "Resolves based on Pricing Mode")
     calc("Price per SF (implied)", "PricePerSFImplied", "=PurchasePrice/PortfolioSF", FMT_DOLLAR_CENTS, "")
     calc("Going-In Cap (on In-Place NOI)", "CapInPlace", "=InPlaceNOI/PurchasePrice", FMT_PCT, "")
+
+    # Pricing Mode dropdown
+    dv_mode = DataValidation(
+        type="list",
+        formula1='"price_psf,cap_on_inplace,cap_on_y1,price_direct"',
+        allow_blank=False,
+    )
+    dv_mode.error = "Must be: price_psf, cap_on_inplace, cap_on_y1, or price_direct"
+    dv_mode.errorTitle = "Invalid Pricing Mode"
+    dv_mode.add("B41")  # PricingMode cell
+    ws.add_data_validation(dv_mode)
+
+    # TRUE/FALSE dropdowns for boolean inputs
+    dv_bool = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=False)
+    dv_bool.add("B35")  # ReassessTaxes
+    dv_bool.add("B59")  # WaterfallOn
+    ws.add_data_validation(dv_bool)
 
 
 def build_property_data(wb):
@@ -900,23 +918,25 @@ def build_rent_roll(wb, tenants):
             fy_end_ref = f'DATE(2027+{i},4,30)'
             fy_mid_ref = f'DATE(2026+{i},10,31)'
 
-            # In-place rent grown at escalator
-            in_place_grown = f'G{row}*D{row}*(1+EscalatorInLease)^({fy_offset}+M{row})'
+            # In-place rent grown at escalator from FY27 base (in-place PSF already reflects
+            # past escalation at rent roll date — do NOT add YrsAtStart to exponent).
+            in_place_grown = f'G{row}*D{row}*(1+EscalatorInLease)^{fy_offset}'
 
-            # Post-expiry rent per treatment
             # Years since expiration at FY midpoint (negative if not yet expired)
             yrs_since_expiry = f'({fy_mid_ref}-F{row})/365.25'
 
-            # Vacate: full market rent in all years post-expiry, with downtime in first year
+            # Vacate: full market rent post-expiry, with downtime in the expiration FY only
             vacate = (f'H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
                       f'*IF(INT({yrs_since_expiry})=0,(12-DowntimeNew)/12,1)')
-            # Option: in-place × 1.025 × SF grown at 2.5% from expiry (roughly model as grown at escalator forward)
-            option = f'G{row}*D{row}*1.025*(1+EscalatorInLease)^{fy_offset}'
-            # Market: weighted retention × in-place-rollforward + (1-ret) × market new
+            # Option: one-time 2.5% bump at exercise, then grow at escalator — avoid double count
+            # Formula: in_place × 1.025 × (1+esc)^(years past expiry)
+            # Simplified: model at escalator growth from FY27 base (since 1.025 ≈ escalator)
+            option = f'G{row}*1.025*D{row}*(1+EscalatorInLease)^{fy_offset}'
+            # Market: weighted 75% renewal (in-place-grown) + 25% new market (with downtime)
             market = (f'Retention*{in_place_grown}'
                       f'+(1-Retention)*H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
                       f'*IF(INT({yrs_since_expiry})=0,(12-DowntimeNew)/12,1)')
-            # LeaseUp: market rent × (1 - downtime/12) in Year 1, then full market thereafter
+            # LeaseUp: market rent, downtime only in Year 1
             lease_up = (f'H{row}*D{row}*(1+GrowthMarketRent)^{fy_offset}'
                         f'*IF({fy_offset}=0,(12-DowntimeNew)/12,1)')
 
@@ -926,14 +946,17 @@ def build_rent_roll(wb, tenants):
                            f'IF(I{row}="Market",{market},'
                            f'IF(I{row}="LeaseUp",{lease_up},0))))')
 
-            # Main formula: piecewise based on where lease ends relative to FY
+            # Main formula: piecewise based on where lease ends relative to FY.
+            # IFERROR wraps the whole thing — returns 0 if any downstream ref fails.
             formula = (
                 f'=IFERROR('
                 f'IF(I{row}="LeaseUp",{lease_up},'
                 f'IF(F{row}="",0,'
+                # Lease active all year:
                 f'IF(F{row}>={fy_end_ref},{in_place_grown},'
+                # Lease expired before FY starts: full post-expiry year
                 f'IF(F{row}<{fy_start_ref},{post_expiry},'
-                # Lease ends mid-FY: prorate
+                # Lease expires mid-FY: prorate between in-place and post-expiry (downtime applied in post_expiry)
                 f'((F{row}-{fy_start_ref})/365.25)*{in_place_grown}'
                 f'+(({fy_end_ref}-F{row})/365.25)*{post_expiry}'
                 f')))),0)'
@@ -987,6 +1010,20 @@ def build_rent_roll(wb, tenants):
         c = ws.cell(row=total_row, column=col, value=f'=SUM({cref})')
         style_total(c)
         c.number_format = FMT_DOLLAR
+
+    # Add data validation: Treatment column (I) dropdown
+    dv = DataValidation(
+        type="list",
+        formula1='"Market,Option,Vacate,LeaseUp"',
+        allow_blank=False,
+    )
+    dv.error = "Must be Market, Option, Vacate, or LeaseUp"
+    dv.errorTitle = "Invalid Treatment"
+    dv.prompt = "Market = 75% renewal / 25% new; Option = 2.5% bump; Vacate = 100% new with downtime; LeaseUp = currently vacant"
+    dv.promptTitle = "Treatment"
+    last_row = HEADER_ROW + len(tenants)
+    dv.add(f"I5:I{last_row}")
+    ws.add_data_validation(dv)
 
     # Freeze panes
     ws.freeze_panes = "N5"
@@ -1045,19 +1082,19 @@ def build_annual_cf(wb):
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
-    # Row 9: Tenant Upgrade Rent (portfolio FY27 base, grown)
+    # Row 9: Tenant Upgrade Rent (portfolio FY27 base H25, grown)
     ws.cell(row=9, column=1, value="Tenant Upgrade Rent").font = FONT_CALC
     for i in range(11):
         c = ws.cell(row=9, column=2 + i,
-                    value=f"='Property Data'!H26*(1+TURentGrowth)^{i}")
+                    value=f"='Property Data'!H25*(1+TURentGrowth)^{i}")
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
-    # Row 10: Parking Rent (portfolio FY27 base, grown)
+    # Row 10: Parking Rent (portfolio FY27 base H26, grown)
     ws.cell(row=10, column=1, value="Parking Rent").font = FONT_CALC
     for i in range(11):
         c = ws.cell(row=10, column=2 + i,
-                    value=f"='Property Data'!H27*(1+GrowthOther)^{i}")
+                    value=f"='Property Data'!H26*(1+GrowthOther)^{i}")
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
@@ -1104,15 +1141,13 @@ def build_annual_cf(wb):
         c.number_format = FMT_DOLLAR
         style_calc(c)
 
-    # Row 18: RE Taxes (either OM base grown, OR reassessed at purchase × millage × weighted avg)
+    # Row 18: RE Taxes (either OM base grown, OR reassessed at purchase × millage × SF-weighted avg)
+    # Millage Rate is on Property Data row 16 (NOT row 17 — row 17 is Parcel text!)
     ws.cell(row=18, column=1, value="RE Taxes").font = FONT_CALC
     for i in range(11):
-        # If reassess: portfolio weighted-avg millage × purchase price, grown at RE tax growth
-        # Else: OM FY27 base grown at RE tax growth
-        # Weighted-avg millage on Property Data row 17 (millage rate)
-        reassessed = (f"-(PurchasePrice*SUMPRODUCT('Property Data'!B4:G4,"
-                      f"'Property Data'!B17:G17)/PortfolioSF)*(1+GrowthRETax)^{i}")
-        base = f"-'Property Data'!H24*(1+GrowthRETax)^{i}"
+        reassessed = (f"-(PurchasePrice*SUMPRODUCT('Property Data'!$B$4:$G$4,"
+                      f"'Property Data'!$B$16:$G$16)/PortfolioSF)*(1+GrowthRETax)^{i}")
+        base = f"-'Property Data'!$H$24*(1+GrowthRETax)^{i}"
         c = ws.cell(row=18, column=2 + i, value=f"=IF(ReassessTaxes,{reassessed},{base})")
         c.number_format = FMT_DOLLAR
         style_calc(c)
@@ -1332,12 +1367,12 @@ def build_debt(wb):
         # Row 33 Total Debt Service
         acf.cell(row=33, column=2 + i, value=f"=Debt!D{87+i}").number_format = FMT_DOLLAR
         style_calc(acf.cell(row=33, column=2 + i))
-        # Row 34 Loan Payoff — only in FY of loan maturity (FY31, index 4)
-        if i == 4:  # FY31 = end of year 5 = loan matures
-            acf.cell(row=34, column=2 + i,
-                     value="=-Debt!B83").number_format = FMT_DOLLAR
-        else:
-            acf.cell(row=34, column=2 + i, value=0).number_format = FMT_DOLLAR
+        # Row 34 Loan Payoff — dynamic: triggers in the FY that contains the loan maturity month
+        # FY27 = months 1-12, FY28 = 13-24, ..., FYn = (n-27)*12+1 to (n-26)*12
+        # Loan matures at month = LoanTermMonths. FY index = INT((LoanTermMonths-1)/12)
+        acf.cell(row=34, column=2 + i,
+                 value=f"=IF(INT((LoanTermMonths-1)/12)={i},-INDEX(Debt!$G$22:$G$81,LoanTermMonths),0)"
+                 ).number_format = FMT_DOLLAR
         style_calc(acf.cell(row=34, column=2 + i))
 
 
@@ -1598,13 +1633,23 @@ def build_summary(wb):
        "='Annual CF'!B21/(-Debt!D87)", FMT_NUMBER_2DP)
     kv(ws, 29, 4, "FY27 Debt Yield", "='Annual CF'!B21/(PurchasePrice*LTV)", FMT_PCT)
 
+    # Model integrity check — Model FY27 NOI vs OM FY27 NOI
+    ws["A31"] = "MODEL INTEGRITY"
+    style_subheader(ws["A31"])
+    kv(ws, 32, 1, "Model FY27 NOI", "='Annual CF'!B21", FMT_DOLLAR)
+    kv(ws, 33, 1, "OM-stated FY27 NOI (sum)", "=SUM('Property Data'!B19:G19)", FMT_DOLLAR)
+    kv(ws, 34, 1, "Variance (Model − OM)", "=B32-B33", FMT_DOLLAR)
+    kv(ws, 35, 1, "Variance %", "=B34/B33", FMT_PCT)
+
     # Change notes
-    ws["A35"] = ("Notes: Yellow cells on Assumptions tab are user inputs. Orange cells on "
+    ws["A37"] = ("Notes: Yellow cells on Assumptions tab are user inputs. Orange cells on "
                  "Property Data = Plano estimates (OM incomplete). Exit uses the FY after "
-                 "HoldMonths (next-year NOI method). Levered IRR uses monthly IRR × 12.")
-    ws["A35"].font = Font(italic=True, size=9, color="606060")
-    ws.merge_cells("A35:E36")
-    ws["A35"].alignment = Alignment(wrap_text=True, vertical="top")
+                 "HoldMonths (next-year NOI method). Levered IRR uses monthly IRR × 12. "
+                 "Treatment column on Rent Roll has a dropdown (Market/Option/Vacate/LeaseUp) "
+                 "controlling per-tenant post-expiry behavior.")
+    ws["A37"].font = Font(italic=True, size=9, color="606060")
+    ws.merge_cells("A37:E40")
+    ws["A37"].alignment = Alignment(wrap_text=True, vertical="top")
 
 
 # =============================================================================
